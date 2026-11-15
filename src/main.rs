@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Body, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, env, fs, io::{Read, Write}, os::unix::fs::OpenOptionsExt, path::Path, process::{Command, Stdio}, thread, time::Duration};
@@ -54,6 +54,33 @@ fn send(client: &Client, cfg: &Config, chat: i64, text: &str) -> Result<()> {
     }
     Ok(())
 }
+fn send_file(client: &Client, cfg: &Config, chat: i64, path: &str) -> Result<String> {
+    let path = Path::new(path);
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() { bail!("Path is not a regular file"); }
+    // Keep multipart headers safe even for filenames containing quotes or newlines.
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+        .chars().map(|c| if c.is_control() || c == '"' || c == '\\' { '_' } else { c }).collect::<String>();
+    let boundary = format!("vm-agent-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+    let prefix = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+    let suffix = format!("\r\n--{boundary}--\r\n");
+    let length = (prefix.len() as u64).checked_add(metadata.len())
+        .and_then(|n| n.checked_add(suffix.len() as u64)).ok_or_else(|| anyhow!("File is too large"))?;
+    let body = std::io::Cursor::new(prefix.into_bytes()).chain(file).chain(std::io::Cursor::new(suffix.into_bytes()));
+    let url = format!("https://api.telegram.org/bot{}/sendDocument", cfg.telegram_bot_token);
+    let response = client.post(url)
+        .header(reqwest::header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .header(reqwest::header::CONTENT_LENGTH, length)
+        .body(Body::new(body)).send().map_err(|e| e.without_url()).context("uploading file to Telegram")?;
+    let status = response.status();
+    let value: Value = response.json().context("reading Telegram upload response")?;
+    if !status.is_success() || value["ok"] != true {
+        bail!("Telegram upload failed (HTTP {status}): {}", value["description"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(format!("Sent {} to the current Telegram chat.", path.display()))
+}
 fn bash(command: &str, timeout: u64) -> Result<String> {
     // Files avoid pipe-buffer deadlocks while waiting for the process.
     let base = env::temp_dir().join(format!("vm-agent-{}", std::process::id()));
@@ -74,7 +101,7 @@ fn bash(command: &str, timeout: u64) -> Result<String> {
     let _ = fs::remove_dir_all(base);
     Ok(result)
 }
-fn run_turn(client: &Client, cfg: &Config, conv: &mut Conversation) -> Result<String> {
+fn run_turn(client: &Client, cfg: &Config, chat: i64, conv: &mut Conversation) -> Result<String> {
     for _ in 0..cfg.max_tool_rounds {
         let mut body = cfg.models.get(&conv.model).ok_or_else(|| anyhow!("Selected model config no longer exists"))?.clone();
         let obj = body.as_object_mut().ok_or_else(|| anyhow!("Model request must be a JSON object"))?;
@@ -82,7 +109,7 @@ fn run_turn(client: &Client, cfg: &Config, conv: &mut Conversation) -> Result<St
         messages.extend(conv.messages.clone());
         obj.insert("messages".into(), json!(messages));
         obj.insert("stream".into(), json!(false));
-        obj.insert("tools".into(), json!([{ "type":"function", "function": {"name":"bash", "description":"Run a bash command on the Linux machine and return its output.", "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}]));
+        obj.insert("tools".into(), json!([{ "type":"function", "function": {"name":"bash", "description":"Run a bash command on the Linux machine and return its output.", "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}, {"type":"function", "function":{"name":"send_file", "description":"Send a local file as a document to the current authorized Telegram chat.", "parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the local file to send"}},"required":["path"],"additionalProperties":false}}}]));
         let response = client.post("https://openrouter.ai/api/v1/chat/completions")
             .bearer_auth(&cfg.openrouter_api_key).json(&body).send()?.error_for_status()?.json::<Value>()?;
         let message = response.pointer("/choices/0/message").filter(|v| v.is_object()).ok_or_else(|| anyhow!("OpenRouter returned no assistant message: {response}"))?.clone();
@@ -101,6 +128,11 @@ fn run_turn(client: &Client, cfg: &Config, conv: &mut Conversation) -> Result<St
                 match call["function"]["arguments"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).and_then(|v| v["command"].as_str().map(str::to_owned)) {
                     Some(command) => bash(&command, cfg.command_timeout_seconds).unwrap_or_else(|e| format!("Failed to execute command: {e:#}")),
                     None => "Invalid bash arguments".into(),
+                }
+            } else if call["function"]["name"] == "send_file" {
+                match call["function"]["arguments"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).and_then(|v| v["path"].as_str().map(str::to_owned)) {
+                    Some(path) => send_file(client, cfg, chat, &path).unwrap_or_else(|e| format!("Failed to send file: {e:#}")),
+                    None => "Invalid send_file arguments".into(),
                 }
             } else { "Unknown tool".into() };
             results.push(json!({"role":"tool","tool_call_id":id,"content":output}));
@@ -129,7 +161,7 @@ fn process(client: &Client, cfg: &Config, state: &mut State, update: &Value) -> 
         "Send a message to the agent. Commands: /clear, /model, /model NAME, /help".into()
     } else {
         conv.messages.push(json!({"role":"user","content":input}));
-        match run_turn(client, cfg, conv) {
+        match run_turn(client, cfg, chat, conv) {
             Ok(s) => s,
             Err(e) => { eprintln!("Agent error: {e:#}"); format!("Agent error: {e:#}") }
         }
