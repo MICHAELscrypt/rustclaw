@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, env, fs, io::{Read, Write}, os::unix::fs::OpenOptionsExt, path::Path, process::{Command, Stdio}, thread, time::Duration};
 use wait_timeout::ChildExt;
 
+const APP_NAME: &str = "rustclaw";
+const APP_URL: &str = "https://getrustclaw.com";
+
 #[derive(Deserialize)]
 struct Config {
     telegram_bot_token: String,
@@ -31,7 +34,7 @@ fn save(path: &str, state: &State) -> Result<()> {
     let path = Path::new(path);
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".vm-agent-{}.tmp", std::process::id()));
+    let tmp = parent.join(format!(".rustclaw-{}.tmp", std::process::id()));
     let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     serde_json::to_writer(&mut f, state)?;
     f.flush()?;
@@ -62,7 +65,7 @@ fn send_file(client: &Client, cfg: &Config, chat: i64, path: &str) -> Result<Str
     // Keep multipart headers safe even for filenames containing quotes or newlines.
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
         .chars().map(|c| if c.is_control() || c == '"' || c == '\\' { '_' } else { c }).collect::<String>();
-    let boundary = format!("vm-agent-{}-{}", std::process::id(),
+    let boundary = format!("rustclaw-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
     let prefix = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n");
     let suffix = format!("\r\n--{boundary}--\r\n");
@@ -83,7 +86,7 @@ fn send_file(client: &Client, cfg: &Config, chat: i64, path: &str) -> Result<Str
 }
 fn bash(command: &str, timeout: u64) -> Result<String> {
     // Files avoid pipe-buffer deadlocks while waiting for the process.
-    let base = env::temp_dir().join(format!("vm-agent-{}", std::process::id()));
+    let base = env::temp_dir().join(format!("rustclaw-{}", std::process::id()));
     fs::create_dir_all(&base)?;
     let out = base.join("stdout"); let err = base.join("stderr");
     let mut child = Command::new("bash").arg("-lc").arg(command)
@@ -111,7 +114,10 @@ fn run_turn(client: &Client, cfg: &Config, chat: i64, conv: &mut Conversation) -
         obj.insert("stream".into(), json!(false));
         obj.insert("tools".into(), json!([{ "type":"function", "function": {"name":"bash", "description":"Run a bash command on the Linux machine and return its output.", "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}, {"type":"function", "function":{"name":"send_file", "description":"Send a local file as a document to the current authorized Telegram chat.", "parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the local file to send"}},"required":["path"],"additionalProperties":false}}}]));
         let response = client.post("https://openrouter.ai/api/v1/chat/completions")
-            .bearer_auth(&cfg.openrouter_api_key).json(&body).send()?.error_for_status()?.json::<Value>()?;
+            .bearer_auth(&cfg.openrouter_api_key)
+            .header("X-Title", APP_NAME)
+            .header("HTTP-Referer", APP_URL)
+            .json(&body).send()?.error_for_status()?.json::<Value>()?;
         let message = response.pointer("/choices/0/message").filter(|v| v.is_object()).ok_or_else(|| anyhow!("OpenRouter returned no assistant message: {response}"))?.clone();
         let calls = message.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
         if calls.is_empty() {

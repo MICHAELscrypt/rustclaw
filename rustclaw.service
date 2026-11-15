@@ -1,14 +1,14 @@
 [Unit]
-Description=Telegram Linux VM agent
+Description=rustclaw - Telegram Linux AI agent
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/vm-agent
-ExecStart=/opt/vm-agent/vm-agent /etc/vm-agent/config.jsonc
-StateDirectory=vm-agent
+WorkingDirectory=/opt/rustclaw
+ExecStart=/opt/rustclaw/rustclaw /etc/rustclaw/config.jsonc
+StateDirectory=rustclaw
 StateDirectoryMode=0700
 UMask=0077
 Restart=on-failure

@@ -654,6 +654,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "rustclaw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "json_comments",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "wait-timeout",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,18 +1006,6 @@ name = "utf_types"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
-
-[[package]]
-name = "vm-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "json_comments",
- "reqwest",
- "serde",
- "serde_json",
- "wait-timeout",
-]
 
 [[package]]
 name = "wait-timeout"
