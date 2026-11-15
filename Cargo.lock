@@ -660,9 +660,11 @@ dependencies = [
  "anyhow",
  "json_comments",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "wait-timeout",
+ "webpki-roots",
 ]
 
 [[package]]

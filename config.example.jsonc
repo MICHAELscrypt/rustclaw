@@ -1,6 +1,11 @@
 {
+  "telegram_enabled": true,
   "telegram_bot_token": "REPLACE_ME",
   "allowed_user_ids": [123456789],
+  "irc_enabled": false,
+  "irc_network": "irc.freenode.net",
+  "irc_nickname": "rustclaw",
+  "irc_token": "REPLACE_ME_WITH_AT_LEAST_128_CHARACTERS_NO_WHITESPACE",
   "openrouter_api_key": "REPLACE_ME",
   "default_model": "default",
   "models": {

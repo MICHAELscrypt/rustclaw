@@ -1,17 +1,39 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Body, Client};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, env, fs, io::{Read, Write}, os::unix::fs::OpenOptionsExt, path::Path, process::{Command, Stdio}, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 use wait_timeout::ChildExt;
 
 const APP_NAME: &str = "rustclaw";
 const APP_URL: &str = "https://getrustclaw.com";
+const IRC_PORT: u16 = 6697;
+const IRC_LINE_BYTES: usize = 400;
+const IRC_RATE_LIMIT: Duration = Duration::from_secs(1);
+const IRC_TOKEN_MIN_CHARS: usize = 128;
 
 #[derive(Deserialize)]
 struct Config {
-    telegram_bot_token: String,
-    allowed_user_ids: Vec<i64>,
+    #[serde(default = "telegram_enabled_default")] telegram_enabled: bool,
+    #[serde(default)] telegram_bot_token: String,
+    #[serde(default)] allowed_user_ids: Vec<i64>,
+    #[serde(default)] irc_enabled: bool,
+    #[serde(default = "irc_network_default")] irc_network: String,
+    #[serde(default = "irc_nickname_default")] irc_nickname: String,
+    #[serde(default)] irc_token: String,
     openrouter_api_key: String,
     default_model: String,
     models: BTreeMap<String, Value>,
@@ -20,6 +42,9 @@ struct Config {
     #[serde(default = "timeout_default")] command_timeout_seconds: u64,
     #[serde(default = "rounds_default")] max_tool_rounds: usize,
 }
+fn telegram_enabled_default() -> bool { true }
+fn irc_network_default() -> String { "irc.libera.chat".into() }
+fn irc_nickname_default() -> String { "rustclaw".into() }
 fn timeout_default() -> u64 { 120 }
 fn rounds_default() -> usize { 20 }
 #[derive(Default, Serialize, Deserialize)]
@@ -29,6 +54,32 @@ struct State {
 }
 #[derive(Serialize, Deserialize)]
 struct Conversation { model: String, messages: Vec<Value> }
+
+fn validate(cfg: &Config) -> Result<()> {
+    if !cfg.telegram_enabled && !cfg.irc_enabled { bail!("Enable at least one channel: telegram_enabled or irc_enabled"); }
+    if cfg.telegram_enabled {
+        if cfg.telegram_bot_token.is_empty() { bail!("telegram_enabled is true but telegram_bot_token is empty"); }
+        if cfg.allowed_user_ids.is_empty() { bail!("telegram_enabled is true but allowed_user_ids is empty"); }
+    }
+    if cfg.irc_enabled {
+        if cfg.irc_token.chars().count() < IRC_TOKEN_MIN_CHARS { bail!("irc_token must be at least {IRC_TOKEN_MIN_CHARS} characters"); }
+        if cfg.irc_token.chars().any(char::is_whitespace) { bail!("irc_token must not contain whitespace"); }
+        if !valid_hostname(&cfg.irc_network) { bail!("Invalid irc_network"); }
+        if !valid_nick(&cfg.irc_nickname) { bail!("Invalid irc_nickname"); }
+    }
+    if cfg.openrouter_api_key.is_empty() { bail!("openrouter_api_key is empty"); }
+    if !cfg.models.contains_key(&cfg.default_model) || cfg.models.values().any(|v| !v.is_object()) { bail!("Invalid model configuration"); }
+    if cfg.command_timeout_seconds == 0 || cfg.max_tool_rounds == 0 { bail!("Timeout and tool-round limit must be positive"); }
+    Ok(())
+}
+fn valid_hostname(host: &str) -> bool {
+    !host.is_empty() && host.len() <= 253 && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+fn valid_nick(nick: &str) -> bool {
+    (1..=16).contains(&nick.chars().count())
+        && nick.chars().all(|c| c.is_ascii_alphanumeric() || "_-[]\\`^{}|".contains(c))
+        && !nick.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
 
 fn save(path: &str, state: &State) -> Result<()> {
     let path = Path::new(path);
@@ -48,7 +99,7 @@ fn telegram(client: &Client, cfg: &Config, method: &str, body: Value) -> Result<
     if v["ok"] != true { bail!("Telegram API error: {}", v["description"]); }
     Ok(v["result"].clone())
 }
-fn send(client: &Client, cfg: &Config, chat: i64, text: &str) -> Result<()> {
+fn send_telegram(client: &Client, cfg: &Config, chat: i64, text: &str) -> Result<()> {
     // Split by Unicode characters, below Telegram's 4096-character limit.
     let chars: Vec<char> = text.chars().collect();
     for part in chars.chunks(3500) {
@@ -104,7 +155,30 @@ fn bash(command: &str, timeout: u64) -> Result<String> {
     let _ = fs::remove_dir_all(base);
     Ok(result)
 }
-fn run_turn(client: &Client, cfg: &Config, chat: i64, conv: &mut Conversation) -> Result<String> {
+
+// One reply path per channel. Only Telegram can send documents.
+enum Sender<'a> {
+    Telegram { client: &'a Client, cfg: &'a Config, chat: i64 },
+    Irc { conn: &'a mut IrcConnection, target: String },
+}
+impl Sender<'_> {
+    fn can_send_files(&self) -> bool { matches!(self, Sender::Telegram { .. }) }
+    fn text(&mut self, text: &str) -> Result<()> {
+        match self {
+            Sender::Telegram { client, cfg, chat } => send_telegram(client, cfg, *chat, text),
+            Sender::Irc { conn, target } => conn.privmsg(target, text),
+        }
+    }
+    fn file(&mut self, path: &str) -> Result<String> {
+        match self {
+            Sender::Telegram { client, cfg, chat } => send_file(client, cfg, *chat, path),
+            Sender::Irc { .. } => bail!("Sending files is not supported over IRC."),
+        }
+    }
+}
+
+fn run_turn(client: &Client, cfg: &Config, conv: &mut Conversation, sender: &mut Sender) -> Result<String> {
+    let can_send_files = sender.can_send_files();
     for _ in 0..cfg.max_tool_rounds {
         let mut body = cfg.models.get(&conv.model).ok_or_else(|| anyhow!("Selected model config no longer exists"))?.clone();
         let obj = body.as_object_mut().ok_or_else(|| anyhow!("Model request must be a JSON object"))?;
@@ -112,7 +186,11 @@ fn run_turn(client: &Client, cfg: &Config, chat: i64, conv: &mut Conversation) -
         messages.extend(conv.messages.clone());
         obj.insert("messages".into(), json!(messages));
         obj.insert("stream".into(), json!(false));
-        obj.insert("tools".into(), json!([{ "type":"function", "function": {"name":"bash", "description":"Run a bash command on the Linux machine and return its output.", "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}, {"type":"function", "function":{"name":"send_file", "description":"Send a local file as a document to the current authorized Telegram chat.", "parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the local file to send"}},"required":["path"],"additionalProperties":false}}}]));
+        let mut tools = vec![json!({ "type":"function", "function": {"name":"bash", "description":"Run a bash command on the Linux machine and return its output.", "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}})];
+        if can_send_files {
+            tools.push(json!({"type":"function", "function":{"name":"send_file", "description":"Send a local file as a document to the current authorized Telegram chat.", "parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the local file to send"}},"required":["path"],"additionalProperties":false}}}));
+        }
+        obj.insert("tools".into(), json!(tools));
         let response = client.post("https://openrouter.ai/api/v1/chat/completions")
             .bearer_auth(&cfg.openrouter_api_key)
             .header("X-Title", APP_NAME)
@@ -135,9 +213,9 @@ fn run_turn(client: &Client, cfg: &Config, chat: i64, conv: &mut Conversation) -
                     Some(command) => bash(&command, cfg.command_timeout_seconds).unwrap_or_else(|e| format!("Failed to execute command: {e:#}")),
                     None => "Invalid bash arguments".into(),
                 }
-            } else if call["function"]["name"] == "send_file" {
+            } else if call["function"]["name"] == "send_file" && can_send_files {
                 match call["function"]["arguments"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).and_then(|v| v["path"].as_str().map(str::to_owned)) {
-                    Some(path) => send_file(client, cfg, chat, &path).unwrap_or_else(|e| format!("Failed to send file: {e:#}")),
+                    Some(path) => sender.file(&path).unwrap_or_else(|e| format!("Failed to send file: {e:#}")),
                     None => "Invalid send_file arguments".into(),
                 }
             } else { "Unknown tool".into() };
@@ -147,56 +225,301 @@ fn run_turn(client: &Client, cfg: &Config, chat: i64, conv: &mut Conversation) -
     }
     bail!("Reached the configured tool-round limit")
 }
-fn process(client: &Client, cfg: &Config, state: &mut State, update: &Value) -> Result<()> {
-    let msg = &update["message"];
-    if msg["chat"]["type"] != "private" { return Ok(()); }
-    let Some(user) = msg["from"]["id"].as_i64() else { return Ok(()); };
-    if !cfg.allowed_user_ids.contains(&user) { return Ok(()); }
-    let Some(chat) = msg["chat"]["id"].as_i64() else { return Ok(()); };
-    let Some(input) = msg["text"].as_str() else { return Ok(()); };
-    let conv = state.conversations.entry(user.to_string()).or_insert_with(|| Conversation { model: cfg.default_model.clone(), messages: Vec::new() });
-    let reply = if input.trim() == "/clear" {
+fn handle_message(client: &Client, cfg: &Config, state: &mut State, key: &str, input: &str, sender: &mut Sender) -> Result<String> {
+    let conv = state.conversations.entry(key.to_string()).or_insert_with(|| Conversation { model: cfg.default_model.clone(), messages: Vec::new() });
+    let trimmed = input.trim();
+    let reply = if trimmed == "/clear" {
         conv.messages.clear(); "Conversation cleared.".to_string()
-    } else if input.trim() == "/model" {
+    } else if trimmed == "/model" {
         format!("Current: {}\nAvailable: {}", conv.model, cfg.models.keys().cloned().collect::<Vec<_>>().join(", "))
-    } else if let Some(name) = input.trim().strip_prefix("/model ") {
+    } else if let Some(name) = trimmed.strip_prefix("/model ") {
         let name = name.trim();
         if cfg.models.contains_key(name) { conv.model = name.to_string(); format!("Model configuration set to {name}.") }
         else { format!("Unknown model configuration: {name}") }
-    } else if input.trim() == "/start" || input.trim() == "/help" {
+    } else if trimmed == "/start" || trimmed == "/help" {
         "Send a message to the agent. Commands: /clear, /model, /model NAME, /help".into()
     } else {
         conv.messages.push(json!({"role":"user","content":input}));
-        match run_turn(client, cfg, chat, conv) {
+        match run_turn(client, cfg, conv, sender) {
             Ok(s) => s,
             Err(e) => { eprintln!("Agent error: {e:#}"); format!("Agent error: {e:#}") }
         }
     };
     // Persist completed conversation before replying, so restarts keep the result.
     save(&cfg.state_file, state)?;
-    send(client, cfg, chat, &reply)
+    Ok(reply)
 }
-fn main() -> Result<()> {
-    let path = env::args().nth(1).unwrap_or_else(|| "config.jsonc".into());
-    let raw = fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-    let cfg: Config = serde_json::from_reader(json_comments::StripComments::new(raw.as_bytes())).context("parsing configuration")?;
-    if cfg.allowed_user_ids.is_empty() || cfg.telegram_bot_token.is_empty() || cfg.openrouter_api_key.is_empty() { bail!("Configure credentials and at least one allowed user ID"); }
-    if !cfg.models.contains_key(&cfg.default_model) || cfg.models.values().any(|v| !v.is_object()) { bail!("Invalid model configuration"); }
-    if cfg.command_timeout_seconds == 0 || cfg.max_tool_rounds == 0 { bail!("Timeout and tool-round limit must be positive"); }
-    let mut state: State = match fs::read(&cfg.state_file) { Ok(bytes) => serde_json::from_slice(&bytes).context("reading state")?, Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(), Err(e) => return Err(e.into()) };
-    let client = Client::builder().timeout(Duration::from_secs(180)).build()?;
+
+fn process(client: &Client, cfg: &Config, state: &Mutex<State>, update: &Value) -> Result<()> {
+    let msg = &update["message"];
+    if msg["chat"]["type"] != "private" { return Ok(()); }
+    let Some(user) = msg["from"]["id"].as_i64() else { return Ok(()); };
+    if !cfg.allowed_user_ids.contains(&user) { return Ok(()); }
+    let Some(chat) = msg["chat"]["id"].as_i64() else { return Ok(()); };
+    let Some(input) = msg["text"].as_str() else { return Ok(()); };
+    let mut sender = Sender::Telegram { client, cfg, chat };
+    let reply = {
+        let mut state = state.lock().unwrap();
+        handle_message(client, cfg, &mut state, &user.to_string(), input, &mut sender)?
+    };
+    sender.text(&reply)
+}
+fn telegram_loop(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<()> {
     loop {
-        match telegram(&client, &cfg, "getUpdates", json!({"offset":state.offset,"timeout":30,"allowed_updates":["message"]})) {
+        let offset = state.lock().unwrap().offset;
+        match telegram(client, cfg, "getUpdates", json!({"offset":offset,"timeout":30,"allowed_updates":["message"]})) {
             Ok(updates) => if let Some(updates) = updates.as_array() {
                 for update in updates {
                     let Some(id) = update["update_id"].as_i64() else { continue; };
                     // Acknowledge before executing: avoids rerunning shell commands after a crash.
-                    state.offset = id + 1;
-                    save(&cfg.state_file, &state)?;
-                    if let Err(e) = process(&client, &cfg, &mut state, update) { eprintln!("Update error: {e:#}"); }
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.offset = id + 1;
+                        save(&cfg.state_file, &state)?;
+                    }
+                    if let Err(e) = process(client, cfg, state, update) { eprintln!("Update error: {e:#}"); }
                 }
             },
-            Err(e) => { eprintln!("Polling error: {e:#}"); thread::sleep(Duration::from_secs(5)); }
+            Err(e) => { eprintln!("Telegram polling error: {e:#}"); thread::sleep(Duration::from_secs(5)); }
         }
+    }
+}
+
+struct IrcConnection {
+    network: String,
+    nick: String,
+    nick_base: String,
+    nick_attempt: u32,
+    reader: BufReader<StreamOwned<ClientConnection, TcpStream>>,
+    registered: bool,
+    next_send: Instant,
+}
+impl IrcConnection {
+    fn connect(network: &str, nick: &str) -> Result<Self> {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let name = ServerName::try_from(network.to_string()).map_err(|_| anyhow!("Invalid IRC network name"))?;
+        let tls = ClientConnection::new(Arc::new(tls), name)?;
+        let socket = TcpStream::connect((network, IRC_PORT))
+            .with_context(|| format!("connecting to {network}:{IRC_PORT}"))?;
+        socket.set_nodelay(true)?;
+        // IRC servers ping idle clients; anything longer than that is a dead connection.
+        socket.set_read_timeout(Some(Duration::from_secs(360)))?;
+        Ok(Self {
+            network: network.to_string(),
+            nick: nick.to_string(),
+            nick_base: nick.to_string(),
+            nick_attempt: 0,
+            reader: BufReader::new(StreamOwned::new(tls, socket)),
+            registered: false,
+            next_send: Instant::now(),
+        })
+    }
+    fn register(&mut self) -> Result<()> {
+        let nick = self.nick.clone();
+        self.send_raw(&format!("NICK {nick}"))?;
+        self.send_raw(&format!("USER rustclaw 0 * :{nick}"))?;
+        Ok(())
+    }
+    fn send_raw(&mut self, line: &str) -> Result<()> {
+        let stream = self.reader.get_mut();
+        stream.write_all(line.as_bytes())?;
+        stream.write_all(b"\r\n")?;
+        stream.flush()?;
+        Ok(())
+    }
+    fn privmsg(&mut self, target: &str, text: &str) -> Result<()> {
+        for line in irc_lines(text) {
+            let wait = self.next_send.saturating_duration_since(Instant::now());
+            if !wait.is_zero() { thread::sleep(wait); }
+            self.send_raw(&format!("PRIVMSG {target} :{line}"))?;
+            self.next_send = Instant::now() + IRC_RATE_LIMIT;
+        }
+        Ok(())
+    }
+}
+fn nick_with_suffix(base: &str, attempt: u32) -> String {
+    let suffix = attempt.to_string();
+    let keep = 16usize.saturating_sub(suffix.len()).max(1);
+    let mut nick: String = base.chars().take(keep).collect();
+    nick.push_str(&suffix);
+    nick
+}
+// Split into IRC-safe lines: no CR/LF (command injection), no control characters,
+// and chunks that stay below the byte limit without cutting UTF-8 characters.
+fn irc_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        let clean: String = raw.chars().filter(|c| *c != '\r' && (!c.is_control() || *c == '\t')).collect();
+        if clean.trim().is_empty() { continue; }
+        let mut chunk = String::new();
+        let mut size = 0;
+        for ch in clean.chars() {
+            let width = ch.len_utf8();
+            if size + width > IRC_LINE_BYTES {
+                out.push(std::mem::take(&mut chunk));
+                size = 0;
+            }
+            chunk.push(ch);
+            size += width;
+        }
+        if !chunk.is_empty() { out.push(chunk); }
+    }
+    if out.is_empty() { out.push(String::new()); }
+    out
+}
+fn parse_line(line: &str) -> Option<(&str, &str, &str)> {
+    let line = match line.strip_prefix('@') { Some(tags) => tags.split_once(' ')?.1, None => line };
+    let (prefix, rest) = match line.strip_prefix(':') {
+        Some(rest) => rest.split_once(' ').unwrap_or((rest, "")),
+        None => ("", line),
+    };
+    let (command, params) = rest.split_once(' ').unwrap_or((rest, ""));
+    Some((prefix, command, params))
+}
+fn irc_lower(c: char) -> char {
+    match c.to_ascii_lowercase() {
+        '[' => '{', ']' => '}', '\\' => '|', '^' => '~', c => c,
+    }
+}
+fn irc_nick_eq(a: &str, b: &str) -> bool {
+    a.chars().map(irc_lower).eq(b.chars().map(irc_lower))
+}
+// Require "<token> <message>" so unauthenticated DMs are dropped. Compare in
+// constant time to avoid leaking the token through response timing.
+fn verify_token<'a>(expected: &str, message: &'a str) -> Option<&'a str> {
+    if expected.is_empty() { return None; }
+    let expected = expected.as_bytes();
+    let actual = message.as_bytes();
+    let mut diff = u8::from(actual.len() < expected.len());
+    for (i, byte) in expected.iter().enumerate() {
+        diff |= byte ^ actual.get(i).copied().unwrap_or(0);
+    }
+    if diff != 0 { return None; }
+    let rest = &message[expected.len()..];
+    if rest.is_empty() { return Some(""); }
+    if !rest.starts_with(char::is_whitespace) { return None; }
+    Some(rest.trim_start())
+}
+fn irc_loop(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<()> {
+    loop {
+        if let Err(e) = irc_session(client, cfg, state) { eprintln!("IRC error: {e:#}"); }
+        eprintln!("IRC: reconnecting to {} in 10 seconds", cfg.irc_network);
+        thread::sleep(Duration::from_secs(10));
+    }
+}
+fn irc_session(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<()> {
+    eprintln!("IRC: connecting to {}:{}", cfg.irc_network, IRC_PORT);
+    let mut conn = IrcConnection::connect(&cfg.irc_network, &cfg.irc_nickname)?;
+    conn.register()?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if conn.reader.read_line(&mut line)? == 0 { bail!("Connection closed by server"); }
+        let Some((prefix, command, params)) = parse_line(line.trim_end_matches(['\r', '\n'])) else { continue; };
+        match command {
+            "PING" => {
+                conn.send_raw(&format!("PONG :{}", params.trim_start_matches(':')))?;
+            }
+            "001" => {
+                conn.registered = true;
+                println!("IRC: connected to {} as {}", conn.network, conn.nick);
+            }
+            "433" if !conn.registered => {
+                conn.nick_attempt += 1;
+                if conn.nick_attempt > 5 { bail!("Nickname {} is already in use", conn.nick_base); }
+                conn.nick = nick_with_suffix(&conn.nick_base, conn.nick_attempt);
+                let nick = conn.nick.clone();
+                conn.send_raw(&format!("NICK {nick}"))?;
+            }
+            "PRIVMSG" => {
+                let Some((target, text)) = params.split_once(' ') else { continue; };
+                // Only answer DMs addressed to us; channels are never joined.
+                if !irc_nick_eq(target.trim_start_matches(':'), &conn.nick) { continue; }
+                let nick = prefix.split('!').next().unwrap_or(prefix).to_string();
+                if irc_nick_eq(&nick, &conn.nick) { continue; }
+                let Some(text) = text.strip_prefix(':') else { continue; };
+                // Invalid or missing tokens are silently dropped.
+                let Some(input) = verify_token(&cfg.irc_token, text) else { continue; };
+                let input = if input.trim().is_empty() { "/help" } else { input };
+                let key = format!("irc:{}", nick.to_ascii_lowercase());
+                let mut sender = Sender::Irc { conn: &mut conn, target: nick.clone() };
+                let reply = {
+                    let mut state = state.lock().unwrap();
+                    handle_message(client, cfg, &mut state, &key, input, &mut sender)?
+                };
+                sender.text(&reply)?;
+            }
+            "ERROR" => bail!("Server closed the connection: {}", params.trim_start_matches(':')),
+            _ => {}
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let path = env::args().nth(1).unwrap_or_else(|| "config.jsonc".into());
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+    let cfg: Config = serde_json::from_reader(json_comments::StripComments::new(raw.as_bytes())).context("parsing configuration")?;
+    validate(&cfg)?;
+    let state: State = match fs::read(&cfg.state_file) { Ok(bytes) => serde_json::from_slice(&bytes).context("reading state")?, Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(), Err(e) => return Err(e.into()) };
+    let cfg = Arc::new(cfg);
+    let state = Arc::new(Mutex::new(state));
+    let client = Arc::new(Client::builder().timeout(Duration::from_secs(180)).build()?);
+    let mut channels = Vec::new();
+    if cfg.telegram_enabled {
+        let (cfg, state, client) = (cfg.clone(), state.clone(), client.clone());
+        channels.push(thread::spawn(move || telegram_loop(&client, &cfg, &state)));
+    }
+    if cfg.irc_enabled {
+        let (cfg, state, client) = (cfg.clone(), state.clone(), client.clone());
+        channels.push(thread::spawn(move || irc_loop(&client, &cfg, &state)));
+    }
+    for channel in channels {
+        match channel.join() {
+            Ok(Ok(())) => eprintln!("Communication channel stopped"),
+            Ok(Err(e)) => eprintln!("Communication channel stopped: {e:#}"),
+            Err(_) => eprintln!("Communication channel panicked"),
+        }
+    }
+    bail!("All communication channels stopped")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_long_replies_at_byte_limit_on_char_boundaries() {
+        let lines = irc_lines(&"ä".repeat(300));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), 400);
+        assert_eq!(lines[1].len(), 200);
+        assert!(lines.iter().all(|l| l.len() <= IRC_LINE_BYTES && std::str::from_utf8(l.as_bytes()).is_ok()));
+    }
+    #[test]
+    fn splits_lines_and_strips_control_characters() {
+        let lines = irc_lines("one\r\ntwo\x01three\n\nfour\n");
+        assert_eq!(lines, ["one", "twothree", "four"]);
+    }
+    #[test]
+    fn verifies_tokens() {
+        let token = "a".repeat(IRC_TOKEN_MIN_CHARS);
+        assert_eq!(verify_token(&token, &format!("{token} hello")), Some("hello"));
+        assert_eq!(verify_token(&token, &token), Some(""));
+        assert_eq!(verify_token(&token, &format!("{}X hello", &token[..127])), None);
+        assert_eq!(verify_token(&token, &format!("{token}hello")), None);
+        assert_eq!(verify_token(&token, "hello"), None);
+        assert_eq!(verify_token("", "hello"), None);
+    }
+    #[test]
+    fn parses_irc_lines() {
+        let (prefix, command, params) = parse_line(":alice!user@host PRIVMSG rustclaw :hi there").unwrap();
+        assert_eq!((prefix, command, params), ("alice!user@host", "PRIVMSG", "rustclaw :hi there"));
+        assert!(irc_nick_eq("RustClaw", "rustclaw"));
+        assert!(irc_nick_eq("[nick]", "{nick}"));
+        assert!(!irc_nick_eq("rustclaw", "rustclaw2"));
+        assert_eq!(nick_with_suffix("rustclaw", 2), "rustclaw2");
+        assert_eq!(nick_with_suffix("0123456789abcdef", 12), "0123456789abcd12");
     }
 }
