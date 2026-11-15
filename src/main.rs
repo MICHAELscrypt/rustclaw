@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Body, Client};
-use rustls::pki_types::ServerName;
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -21,6 +22,8 @@ use wait_timeout::ChildExt;
 const APP_NAME: &str = "rustclaw";
 const APP_URL: &str = "https://getrustclaw.com";
 const IRC_PORT: u16 = 6697;
+const IRC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const IRC_IDLE_TIMEOUT: Duration = Duration::from_secs(360);
 const IRC_LINE_BYTES: usize = 400;
 const IRC_RATE_LIMIT: Duration = Duration::from_secs(1);
 const IRC_TOKEN_MIN_CHARS: usize = 128;
@@ -34,6 +37,7 @@ struct Config {
     #[serde(default = "irc_network_default")] irc_network: String,
     #[serde(default = "irc_nickname_default")] irc_nickname: String,
     #[serde(default)] irc_token: String,
+    #[serde(default = "irc_tls_verify_default")] irc_tls_verify: bool,
     openrouter_api_key: String,
     default_model: String,
     models: BTreeMap<String, Value>,
@@ -45,6 +49,7 @@ struct Config {
 fn telegram_enabled_default() -> bool { true }
 fn irc_network_default() -> String { "irc.libera.chat".into() }
 fn irc_nickname_default() -> String { "rustclaw".into() }
+fn irc_tls_verify_default() -> bool { true }
 fn timeout_default() -> u64 { 120 }
 fn rounds_default() -> usize { 20 }
 #[derive(Default, Serialize, Deserialize)]
@@ -285,6 +290,33 @@ fn telegram_loop(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<
     }
 }
 
+// Used only when irc_tls_verify is disabled, e.g. for networks with expired,
+// self-signed, or very old (v1) certificates. Nothing about the peer is
+// authenticated: the connection can be intercepted. The TLS layer still
+// protects the handshake transcript while the connection is established.
+#[derive(Debug)]
+struct AcceptAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
 struct IrcConnection {
     network: String,
     nick: String,
@@ -295,17 +327,26 @@ struct IrcConnection {
     next_send: Instant,
 }
 impl IrcConnection {
-    fn connect(network: &str, nick: &str) -> Result<Self> {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    fn connect(network: &str, nick: &str, verify_tls: bool) -> Result<Self> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()?;
+        let tls = if verify_tls {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        } else {
+            builder.dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_no_client_auth()
+        };
         let name = ServerName::try_from(network.to_string()).map_err(|_| anyhow!("Invalid IRC network name"))?;
         let tls = ClientConnection::new(Arc::new(tls), name)?;
         let socket = TcpStream::connect((network, IRC_PORT))
             .with_context(|| format!("connecting to {network}:{IRC_PORT}"))?;
         socket.set_nodelay(true)?;
-        // IRC servers ping idle clients; anything longer than that is a dead connection.
-        socket.set_read_timeout(Some(Duration::from_secs(360)))?;
+        // Fail a stalled TLS handshake reasonably quickly; raise this after registration.
+        socket.set_read_timeout(Some(IRC_HANDSHAKE_TIMEOUT))?;
         Ok(Self {
             network: network.to_string(),
             nick: nick.to_string(),
@@ -404,14 +445,20 @@ fn verify_token<'a>(expected: &str, message: &'a str) -> Option<&'a str> {
 }
 fn irc_loop(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<()> {
     loop {
-        if let Err(e) = irc_session(client, cfg, state) { eprintln!("IRC error: {e:#}"); }
+        if let Err(e) = irc_session(client, cfg, state) {
+            eprintln!("IRC error: {e:#}");
+            if cfg.irc_tls_verify && format!("{e:#}").contains("invalid peer certificate") {
+                eprintln!("IRC: set irc_tls_verify to false only if you trust the broken certificate of {}", cfg.irc_network);
+            }
+        }
         eprintln!("IRC: reconnecting to {} in 10 seconds", cfg.irc_network);
         thread::sleep(Duration::from_secs(10));
     }
 }
 fn irc_session(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<()> {
-    eprintln!("IRC: connecting to {}:{}", cfg.irc_network, IRC_PORT);
-    let mut conn = IrcConnection::connect(&cfg.irc_network, &cfg.irc_nickname)?;
+    eprintln!("IRC: connecting to {}:{} ({})", cfg.irc_network, IRC_PORT,
+        if cfg.irc_tls_verify { "TLS verification on" } else { "TLS verification OFF" });
+    let mut conn = IrcConnection::connect(&cfg.irc_network, &cfg.irc_nickname, cfg.irc_tls_verify)?;
     conn.register()?;
     let mut line = String::new();
     loop {
@@ -424,6 +471,8 @@ fn irc_session(client: &Client, cfg: &Config, state: &Mutex<State>) -> Result<()
             }
             "001" => {
                 conn.registered = true;
+                // IRC servers ping idle clients; anything longer than that is a dead connection.
+                conn.reader.get_mut().sock.set_read_timeout(Some(IRC_IDLE_TIMEOUT))?;
                 println!("IRC: connected to {} as {}", conn.network, conn.nick);
             }
             "433" if !conn.registered => {
@@ -472,6 +521,7 @@ fn main() -> Result<()> {
         channels.push(thread::spawn(move || telegram_loop(&client, &cfg, &state)));
     }
     if cfg.irc_enabled {
+        if !cfg.irc_tls_verify { eprintln!("IRC: WARNING: irc_tls_verify is false, so any TLS certificate is accepted and connections can be intercepted"); }
         let (cfg, state, client) = (cfg.clone(), state.clone(), client.clone());
         channels.push(thread::spawn(move || irc_loop(&client, &cfg, &state)));
     }

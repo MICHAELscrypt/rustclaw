@@ -6,6 +6,7 @@
   "irc_network": "irc.freenode.net",
   "irc_nickname": "rustclaw",
   "irc_token": "REPLACE_ME_WITH_AT_LEAST_128_CHARACTERS_NO_WHITESPACE",
+  "irc_tls_verify": true,
   "openrouter_api_key": "REPLACE_ME",
   "default_model": "default",
   "models": {
