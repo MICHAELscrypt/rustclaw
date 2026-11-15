@@ -1,15 +1,17 @@
 {
-  // Keep this file private: it contains credentials and authorizes shell access.
   "telegram_bot_token": "REPLACE_ME",
   "allowed_user_ids": [123456789],
   "openrouter_api_key": "REPLACE_ME",
   "default_model": "default",
-  // Each entry is an OpenRouter chat completions request body. The agent supplies
-  // messages, tools and stream, replacing those fields if present here.
   "models": {
     "default": {
-      "model": "openai/gpt-4o",
-      "provider": { "allow_fallbacks": true }
+      "model": "z-ai/glm-5.3-flash",
+      "provider": {
+        "zdr": false,
+        "order": ["Tenstorrent", "Morph", "Z.AI"],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
     },
     "myModelConfig-3": {
       "model": "anthropic/claude-sonnet-4",
