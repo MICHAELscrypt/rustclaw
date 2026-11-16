@@ -11,7 +11,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     os::unix::fs::OpenOptionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -19,7 +19,7 @@ use std::{
 };
 use wait_timeout::ChildExt;
 
-const APP_NAME: &str = "rustclaw";
+const APP_NAME: &str = "Rustclaw";
 const APP_URL: &str = "https://getrustclaw.com";
 const IRC_PORT: u16 = 6697;
 const IRC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,6 +42,7 @@ struct Config {
     default_model: String,
     models: BTreeMap<String, Value>,
     system_prompt: String,
+    #[serde(default)] skills_directory: String,
     state_file: String,
     #[serde(default = "timeout_default")] command_timeout_seconds: u64,
     #[serde(default = "rounds_default")] max_tool_rounds: usize,
@@ -84,6 +85,96 @@ fn valid_nick(nick: &str) -> bool {
     (1..=16).contains(&nick.chars().count())
         && nick.chars().all(|c| c.is_ascii_alphanumeric() || "_-[]\\`^{}|".contains(c))
         && !nick.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+#[derive(Deserialize)]
+struct SkillMetadata {
+    #[serde(default)] name: Option<String>,
+    #[serde(default)] description: Option<String>,
+}
+const SKILL_FILE: &str = "SKILL.md";
+
+// Build the skill catalog from the YAML front matter of each SKILL.md. Files
+// without both a name and a description are skipped silently.
+fn format_skills_for_prompt(skills_directory: &str) -> String {
+    if skills_directory.trim().is_empty() { return String::new(); }
+    let mut files = Vec::new();
+    collect_skill_files(Path::new(skills_directory), &mut files);
+    files.sort();
+    let mut skills = Vec::new();
+    for path in files {
+        let Ok(contents) = fs::read_to_string(&path) else { continue; };
+        let Some((name, description)) = skill_metadata(&contents) else { continue; };
+        skills.push((name, description, fs::canonicalize(&path).unwrap_or(path)));
+    }
+    if skills.is_empty() { return String::new(); }
+    let mut xml = String::from("<available_skills>\n");
+    for (name, description, location) in skills {
+        xml.push_str("  <skill>\n");
+        xml.push_str(&format!("    <name>{}</name>\n", xml_escape(&name)));
+        if description.contains('\n') {
+            xml.push_str("    <description>\n");
+            for line in description.lines() {
+                xml.push_str(&format!("      {}\n", xml_escape(line.trim_end())));
+            }
+            xml.push_str("    </description>\n");
+        } else {
+            xml.push_str(&format!("    <description>{}</description>\n", xml_escape(&description)));
+        }
+        xml.push_str(&format!("    <location>{}</location>\n", xml_escape(&location.to_string_lossy())));
+        xml.push_str("  </skill>\n");
+    }
+    xml.push_str("</available_skills>");
+    xml
+}
+fn collect_skill_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else { return; };
+    let mut entries: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let Ok(file_type) = entry.file_type() else { continue; };
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_skill_files(&path, files);
+        } else if file_type.is_file() && entry.file_name().to_str() == Some(SKILL_FILE) {
+            files.push(path);
+        }
+    }
+}
+fn skill_metadata(contents: &str) -> Option<(String, String)> {
+    let metadata: SkillMetadata = serde_yaml::from_str(front_matter(contents)?).ok()?;
+    let name = metadata.name?.trim().to_string();
+    let description = metadata.description?.trim().to_string();
+    if name.is_empty() || description.is_empty() { return None; }
+    Some((name, description))
+}
+fn front_matter(contents: &str) -> Option<&str> {
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let mut lines = contents.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim_end() != "---" { return None; }
+    let mut end = first.len();
+    for line in lines {
+        if matches!(line.trim_end(), "---" | "...") {
+            return Some(&contents[first.len()..end]);
+        }
+        end += line.len();
+    }
+    None
+}
+fn xml_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn save(path: &str, state: &State) -> Result<()> {
@@ -184,10 +275,20 @@ impl Sender<'_> {
 
 fn run_turn(client: &Client, cfg: &Config, conv: &mut Conversation, sender: &mut Sender) -> Result<String> {
     let can_send_files = sender.can_send_files();
+    // Rebuilt for every user input and sent only as the single system message,
+    // so a changed catalog never leaves an outdated copy in the conversation.
+    let skills = format_skills_for_prompt(&cfg.skills_directory);
+    let system_prompt = if skills.is_empty() {
+        cfg.system_prompt.clone()
+    } else if cfg.system_prompt.trim().is_empty() {
+        skills
+    } else {
+        format!("{}\n\n{skills}", cfg.system_prompt.trim_end())
+    };
     for _ in 0..cfg.max_tool_rounds {
         let mut body = cfg.models.get(&conv.model).ok_or_else(|| anyhow!("Selected model config no longer exists"))?.clone();
         let obj = body.as_object_mut().ok_or_else(|| anyhow!("Model request must be a JSON object"))?;
-        let mut messages = vec![json!({"role":"system","content":cfg.system_prompt})];
+        let mut messages = vec![json!({"role":"system","content":&system_prompt})];
         messages.extend(conv.messages.clone());
         obj.insert("messages".into(), json!(messages));
         obj.insert("stream".into(), json!(false));
@@ -539,6 +640,63 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn formats_skills_catalog_and_skips_incomplete_metadata() {
+        let dir = test_directory("skills");
+        for (folder, contents) in [
+            ("alpha", "---\nname: alpha\ndescription: First & best.\n---\n# Alpha\n"),
+            ("multi", "---\nname: multi\ndescription: |\n  First line,\n  second line.\n---\n# Multi\n"),
+            ("no-description", "---\nname: no-description\n---\n# No description\n"),
+            ("no-name", "---\ndescription: Missing the name.\n---\n# No name\n"),
+            ("no-front-matter", "# Just a skill\n"),
+            ("bad-yaml", "---\nname: [unclosed\n---\n"),
+        ] {
+            fs::create_dir_all(dir.join(folder)).unwrap();
+            fs::write(dir.join(folder).join(SKILL_FILE), contents).unwrap();
+        }
+        // Nested skill directories are discovered too.
+        fs::create_dir_all(dir.join("nested/deep")).unwrap();
+        fs::write(dir.join("nested/deep/SKILL.md"), "---\nname: deep\ndescription: Nested.\n---\n").unwrap();
+
+        let xml = format_skills_for_prompt(dir.to_str().unwrap());
+        assert!(xml.starts_with("<available_skills>\n"));
+        assert!(xml.ends_with("</available_skills>"));
+        assert!(xml.contains("<name>alpha</name>"));
+        assert!(xml.contains("<description>First &amp; best.</description>"));
+        assert!(xml.contains("<name>multi</name>"));
+        assert!(xml.contains("      First line,\n      second line.\n"));
+        assert!(xml.contains("<name>deep</name>"));
+        assert!(!xml.contains("no-description"));
+        assert!(!xml.contains("no-name"));
+        assert!(!xml.contains("Just a skill"));
+        assert!(!xml.contains("unclosed"));
+        let location = fs::canonicalize(dir.join("alpha").join(SKILL_FILE)).unwrap();
+        assert!(xml.contains(&format!("<location>{}</location>", location.display())));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn returns_no_catalog_for_missing_or_empty_skills_directory() {
+        assert_eq!(format_skills_for_prompt(""), "");
+        let dir = test_directory("empty-skills");
+        assert_eq!(format_skills_for_prompt(dir.join("does-not-exist").to_str().unwrap()), "");
+        assert_eq!(format_skills_for_prompt(dir.to_str().unwrap()), "");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn parses_yaml_front_matter_only_at_file_start() {
+        assert_eq!(front_matter("---\nname: a\n---\nbody"), Some("name: a\n"));
+        assert_eq!(front_matter("---\r\nname: a\r\n---\r\nbody"), Some("name: a\r\n"));
+        assert_eq!(front_matter("---\nname: a\n"), None);
+        assert_eq!(front_matter("body\n---\nname: a\n---\n"), None);
+        assert_eq!(front_matter("---\nname: a\n...\n"), Some("name: a\n"));
+    }
+    fn test_directory(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustclaw-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
     #[test]
     fn splits_long_replies_at_byte_limit_on_char_boundaries() {
         let lines = irc_lines(&"ä".repeat(300));

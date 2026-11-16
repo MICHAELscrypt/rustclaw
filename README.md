@@ -1,6 +1,6 @@
 # Rustclaw
 
-![logo-rustclaw](logo-rustclaw_256.png)
+![logo-rustclaw](logo-banner-rustclaw.png)
 
 Rustclaw is a minimal and **opinionated** `*`claw that uses OpenRouter tool calls to run Bash commands. Rustclaw is Linux-native and it is run as systemd service.
 
@@ -8,12 +8,11 @@ Rustclaw is a minimal and **opinionated** `*`claw that uses OpenRouter tool call
 
 Rustclaw is a minimal and **opinionated** `*`claw. I created it because current `*`claw setups like OpenClaw do too much, they are clunky and prone to breaking, and they are fighting a losing battle around security. They put up roadblocks and idiosyncratic workflows around gateways, skills, processes, instead of acknowledging the strengths and weaknesses of a `*`claw system and current LLMs. LLMs are incredible at tool use, they don't need much guidance. And memory-systems are a dead end IMO. Skills are a useful context engineering technique.
 
-Rustclaw has no safety system, it has **full** access to the Linux system it's running on. The full system access will never change, it is meant to be run on a dedicated system such as a VM. 
+Rustclaw has no safety system, it has **full access** to the Linux system it's running on. The full system access will never change, it is meant to be run on a dedicated system such as a VM. 
 
 ## Roadmap
 
 Add a wider range of technologies:
-- Add a Skill system (currently there are no Skills)
 - Make it LLM-provider agnostic (currently only OpenRouter is supported)
 - Implement more communication channels such as XMPP and Discord (currently Telegram and IRC are supported)
 - Document how to run Rustclaw on non-systemd Linux installations, such as Alpine Linux (with OpenRC)
@@ -25,7 +24,7 @@ The following things will not be implemented by Rustclaw, each with a reason:
 - Memory-systems. IMO they are just context-pollution.
 - A web gateway. Lots of OpenClaw security problems come from this, and most `*`claw web frontends look extremely ugly (mine would too, since I'm not a designer).
 
-## Install
+## Technical Explanations about the Program and its Config File
 
 Rustclaw supports Telegram and IRC; there is no web server. Set `telegram_enabled` and `irc_enabled` to choose the channels; at least one must be enabled, and a disabled channel is not started at all. `telegram_enabled` defaults to true when omitted and `irc_enabled` defaults to false.
 
@@ -35,7 +34,13 @@ IRC TLS certificates are verified by default. Some networks serve expired or oth
 
 With either channel, each user (Telegram user ID or IRC nickname) has a separate conversation and selected model. `/clear` removes that user's conversation while keeping their selected model; `/model` lists configurations and `/model NAME` switches one. IRC replies are split into lines of at most about 400 bytes and sent at most one per second. Sending files is Telegram-only. Restart the service after editing the config.
 
+State is stored in `/var/lib/rustclaw/conversations.json` by default, including messages and tool outputs. Protect it as sensitive data. Only one service instance should use the same tokens and state file. Telegram updates are marked handled before processing, to avoid repeating shell commands after a crash; a crash can therefore lose an in-flight message or response. The IRC client reconnects automatically after a disconnect. Completed tool exchanges are kept in memory until the turn finishes, so commands already executed may not appear in saved history if the process stops mid-turn. Commands run serially across channels, and a long command blocks other messages. Timeout kills the immediate shell, but its descendants may survive. Output is capped when returned to the model, though commands can still write large files. There is no automatic context pruning; use `/clear` when needed.
+
+Skills are stored in the directory defined in the config. By default it's `/var/lib/rustclaw/skills/`. Names and descriptions found in the YAML head of each `SKILL.md` gets added to the LLM API call. OpenClaw compatible skills should work, unless they need some specific setup not properly described. 
+
 **This grants anyone controlling an allowed Telegram account, or anyone who knows `irc_token`, root access to the machine.** Model output, web pages, files, and command output can also influence commands. Use a disposable isolated VM, protect the bot token, IRC token, and config, and do not use this on a machine containing anything you cannot afford to lose. The service runs as root so `sudo` is normally unnecessary.
+
+## Install
 
 Install a Rust toolchain and build tools on the Linux VM. From this directory:
 
@@ -46,7 +51,7 @@ sudo install -m 755 target/release/rustclaw /opt/rustclaw/rustclaw
 sudo install -m 600 config.example.jsonc /etc/rustclaw/config.jsonc
 ```
 
-Create a Telegram bot with BotFather and supply its token and your numeric Telegram **user ID**. To use IRC instead (or as well), enable it and set the network, nickname, and token. Supply an OpenRouter API key. Model entries are OpenRouter `/api/v1/chat/completions` JSON request bodies, including optional provider routing. The program supplies `messages`, `tools`, and `stream` itself; it overrides those three fields. Choose models that support tool calling. JSONC comments are supported; trailing commas are not. The example model names are illustrative: choose models available to your OpenRouter account. The API key and tokens must be actual values, not environment variable references.
+Create a Telegram bot with BotFather and supply its token and your numeric Telegram **user ID**. To use IRC instead (or as well), enable it and set the network, nickname, and a 128 character token with no whitespace. Supply an OpenRouter API key. Model entries are OpenRouter `/api/v1/chat/completions` JSON request bodies, including optional provider routing. The program supplies `messages`, `tools`, and `stream` itself; it overrides those three fields. Choose models that support tool calling. JSONC comments are supported; trailing commas are not. The API key and tokens must be actual values, not environment variable references.
 
 ```sh
 sudo editor /etc/rustclaw/config.jsonc
@@ -72,7 +77,9 @@ sudo systemctl stop rustclaw
 sudo journalctl -u rustclaw -f
 ```
 
-State is stored in `/var/lib/rustclaw/conversations.json` by default, including messages and tool outputs. Protect it as sensitive data. Only one service instance should use the same tokens and state file. Telegram updates are marked handled before processing, to avoid repeating shell commands after a crash; a crash can therefore lose an in-flight message or response. The IRC client reconnects automatically after a disconnect. Completed tool exchanges are kept in memory until the turn finishes, so commands already executed may not appear in saved history if the process stops mid-turn. Commands run serially across channels, and a long command blocks other messages. Timeout kills the immediate shell, but its descendants may survive. Output is capped when returned to the model, though commands can still write large files. There is no automatic context pruning; use `/clear` when needed.
+## Upgrade
+
+Same as install, make sure the config is up-to-date with any new settings.
 
 ## Uninstall
 

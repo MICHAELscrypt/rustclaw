@@ -3,7 +3,7 @@
   "telegram_bot_token": "REPLACE_ME",
   "allowed_user_ids": [123456789],
   "irc_enabled": false,
-  "irc_network": "irc.freenode.net",
+  "irc_network": "irc.pureirc.com",
   "irc_nickname": "rustclaw",
   "irc_token": "REPLACE_ME_WITH_AT_LEAST_128_CHARACTERS_NO_WHITESPACE",
   "irc_tls_verify": true,
@@ -19,13 +19,22 @@
         "require_parameters": true
       }
     },
-    "myModelConfig-3": {
-      "model": "anthropic/claude-sonnet-4",
-      "temperature": 0.2
+    "deepseek-v4.1-flash-1017": {
+      "zdr": false,
+      "order": [
+        "Morph",
+        "InferenceNet",
+        "Cloudflare",
+        "DeepSeek"
+      ],
+      "allow_fallbacks": false,
+      "data_collection": "allow",
+      "require_parameters": true
     }
   },
-  "system_prompt": "You are a helpful Linux computer assistant. Use the bash tool when needed. Clearly report command failures and results.",
+  "system_prompt": "You are a helpful Linux computer assistant. Use the bash tool when needed. Clearly report command failures and results. Use skills as you see fit. Read the corresponding `SKILL.md` file for a skill to better know if a skill might actually be of use and how to use it.",
   "state_file": "/var/lib/rustclaw/conversations.json",
+  "skills_directory": "/var/lib/rustclaw/skills/",
   "command_timeout_seconds": 120,
   "max_tool_rounds": 20
 }
