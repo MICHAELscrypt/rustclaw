@@ -20,7 +20,7 @@ use std::{
 use wait_timeout::ChildExt;
 
 const APP_NAME: &str = "Rustclaw";
-const APP_URL: &str = "https://getrustclaw.com";
+const APP_URL: &str = "https://github.com/MICHAELscrypt/rustclaw";
 const IRC_PORT: u16 = 6697;
 const IRC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const IRC_IDLE_TIMEOUT: Duration = Duration::from_secs(360);
